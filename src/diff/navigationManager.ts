@@ -32,8 +32,16 @@ export class NavigationManager {
       return;
     }
 
-    const currentEditor = vscode.window.activeTextEditor;
-    const currentPath = currentEditor ? normalizePath(currentEditor.document.uri.fsPath) : '';
+    // Diff tab là CustomTextEditor (webview), KHÔNG phải TextEditor — nên
+    // `activeTextEditor` là undefined (hoặc còn trỏ vào một text tab cũ ở group
+    // khác) đúng lúc user đang xem diff. Hệ quả cũ: `indexOf` luôn trả -1, Next
+    // luôn nhảy về file pending đầu tiên và Prev về file cuối, bấm bao nhiêu lần
+    // cũng vậy. `getActiveFilePath()` đọc TabInputCustom nên nhận ra đúng diff
+    // đang mở; activeTextEditor chỉ còn là fallback cho text tab thường.
+    const activeEditor = vscode.window.activeTextEditor;
+    const currentPath =
+      this.diffManager.getActiveFilePath() ??
+      (activeEditor ? normalizePath(activeEditor.document.uri.fsPath) : '');
     
     // Nếu chỉ còn 1 file pending: nếu user đang đứng ở file khác thì mở diff đó ngay.
     if (pendingFiles.length === 1) {
