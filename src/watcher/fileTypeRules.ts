@@ -10,7 +10,14 @@ import * as vscode from 'vscode';
 type FileDetectionMode = 'defaultAndCustom' | 'customOnly';
 
 interface TextFileRules {
-  extensions: Set<string>;
+  /**
+   * Mảng chứ không phải Set: khớp phần đuôi phải quét tuần tự (`.js.map`,
+   * `.gradle.kts` … là đuôi nhiều thành phần, `path.extname` không cắt được),
+   * mà `Array.from(set)` trong `isTextFile()` thì dựng lại ~430 chuỗi cho MỖI
+   * file — tức mỗi file của cả workspace trong lượt quét baseline đầu tiên.
+   * Set chỉ còn dùng lúc merge để khử trùng lặp.
+   */
+  extensions: string[];
   filenames: Set<string>;
   filenamePatterns: RegExp[];
 }
@@ -107,7 +114,7 @@ export function isTextFile(filename: string): boolean {
   const lowerName = path.basename(filename).toLowerCase();
   if (textFileRules!.filenames.has(lowerName)) { return true; }
   if (textFileRules!.filenamePatterns.some(pattern => pattern.test(lowerName))) { return true; }
-  return Array.from(textFileRules!.extensions).some(ext => lowerName.endsWith(ext));
+  return textFileRules!.extensions.some(ext => lowerName.endsWith(ext));
 }
 
 export function refreshTextFileRules(): void {
@@ -118,9 +125,9 @@ export function refreshTextFileRules(): void {
   const customPatterns = compileGlobPatterns(config.get<string[]>('supportedFilenamePatterns', []));
 
   textFileRules = {
-    extensions: mode === 'customOnly'
+    extensions: Array.from(mode === 'customOnly'
       ? customExts
-      : new Set([...DEFAULT_TEXT_EXTS, ...customExts]),
+      : new Set([...DEFAULT_TEXT_EXTS, ...customExts])),
     filenames: mode === 'customOnly'
       ? customFilenames
       : new Set([...DEFAULT_TEXT_FILENAMES, ...customFilenames]),
