@@ -224,6 +224,9 @@
       if (!msg) { return; }
       switch (msg.type) {
         case 'set': applySet(msg); return;
+        // Chỉ counter file đổi (một file KHÁC vừa vào/ra hàng chờ). Không đụng
+        // tới model, decoration hay view zone — đó mới là phần đắt.
+        case 'nav': applyNav(msg.nav); return;
         case 'theme-change': applyTheme(msg.theme); return;
         case 'config-change':
           applyConfig(msg.editorConfig);

@@ -12,6 +12,7 @@ import * as vscode from 'vscode';
 import { calculateHunks } from './hunkCalculator';
 import { detectEol, fromLf, toLf } from './eol';
 import { exceedsLineLimit } from '../watcher/fileSizeLimit';
+import { isGitIgnored } from '../watcher/gitignore';
 import { DIFF_EDITOR_VIEW_TYPE } from './diffWebviewPanel';
 import { SnapshotStore, SnapshotState } from './snapshotStore';
 
@@ -38,7 +39,16 @@ function isFileNotFound(error: unknown): boolean {
 }
 
 export class DiffManager {
-  private _onDidChangeDiffs = new vscode.EventEmitter<void>();
+  /**
+   * Bắn ra path (đã normalize) của file vừa đổi, hoặc `undefined` khi cả danh
+   * sách đổi.
+   *
+   * Mang theo path chứ không phải `void` vì mỗi tab diff đều lắng nghe sự kiện
+   * TOÀN CỤC này. Không biết file nào đổi thì mọi tab phải diff lại và gửi lại
+   * nguyên nội dung hai vế qua ranh giới process — trong khi với gần hết số
+   * tab, thứ duy nhất thực sự đổi chỉ là con số "23 / 70".
+   */
+  private _onDidChangeDiffs = new vscode.EventEmitter<string | undefined>();
   public readonly onDidChangeDiffs = this._onDidChangeDiffs.event;
 
   private snapshots: Map<string, SnapshotState> = new Map();
@@ -76,6 +86,9 @@ export class DiffManager {
     if (this.snapshots.has(absPath)) {
       return;
     }
+    // Đường built-in runner cũng phải tôn trọng .gitignore, nếu không setting
+    // chỉ đúng với đường workspace watcher.
+    if (await isGitIgnored(absPath)) { return; }
     const uri = vscode.Uri.file(absPath);
     try {
       await vscode.workspace.fs.stat(uri);
@@ -101,7 +114,21 @@ export class DiffManager {
     void this.store.save(this.snapshots);
   }
 
-  async openDiff(filePath: string, options?: { preserveFocus?: boolean }): Promise<void> {
+  /**
+   * @param options.auto Lần mở này do AI edit kích hoạt, KHÔNG phải user bấm.
+   *   Mở tự động mà cướp tab đang active thì user đang đọc dở diff 23/70 bị ném
+   *   thẳng sang diff 71 ngay khi AI ghi file tiếp theo — mất chỗ đang đọc, và
+   *   càng nhiều edit càng không review nổi. Với `auto`, file chỉ được XẾP HÀNG:
+   *   snapshot vẫn vào pending list nên counter tự lên 23/71, còn tab thì để
+   *   user tự tới bằng next/prev hoặc sau khi accept/reject file hiện tại.
+   *
+   *   `preserveFocus` một mình KHÔNG đủ: nó chỉ giữ focus bàn phím, editor mới
+   *   vẫn thành editor hiển thị của group — user vẫn bị nhảy khỏi chỗ đang đọc.
+   */
+  async openDiff(
+    filePath: string,
+    options?: { preserveFocus?: boolean; auto?: boolean }
+  ): Promise<void> {
     const absPath = normalizePath(filePath);
     const snapshot = this.snapshots.get(absPath);
     if (snapshot === undefined) { return; }
@@ -122,16 +149,31 @@ export class DiffManager {
     if (hunks.length === 0) {
       this.snapshots.delete(absPath);
       void this.store.save(this.snapshots);
-      this._onDidChangeDiffs.fire();
+      this._onDidChangeDiffs.fire(absPath);
       return;
     }
 
     const preserveFocus = options?.preserveFocus === true;
 
+    const isAuto = options?.auto === true;
+
     const existing = this.panels.get(absPath);
     if (existing) {
-      existing.reveal(vscode.ViewColumn.Active, preserveFocus);
-      this._onDidChangeDiffs.fire();
+      // Tab của chính file này đã mở: webview tự refresh qua
+      // onDidChangeTextDocument, nên lần auto không cần reveal — user có thể
+      // đang đọc một diff khác.
+      if (!isAuto) {
+        existing.reveal(vscode.ViewColumn.Active, preserveFocus);
+      }
+      this._onDidChangeDiffs.fire(absPath);
+      return;
+    }
+
+    // Đang có diff mở = user đang review dở. Edit mới chỉ vào hàng chờ.
+    // Lưu ý thứ tự: đoạn tính hunk ở trên vẫn chạy trước, nên file "sửa rồi
+    // thành y hệt cũ" vẫn bị dọn khỏi pending thay vì đọng lại làm lệch counter.
+    if (isAuto && this.panels.size > 0) {
+      this._onDidChangeDiffs.fire(absPath);
       return;
     }
 
@@ -143,7 +185,7 @@ export class DiffManager {
       DIFF_EDITOR_VIEW_TYPE,
       { preview: false, preserveFocus } satisfies vscode.TextDocumentShowOptions
     );
-    this._onDidChangeDiffs.fire();
+    this._onDidChangeDiffs.fire(absPath);
   }
 
   /**
@@ -173,7 +215,7 @@ export class DiffManager {
     if (!this.snapshots.has(absPath)) {
       this.snapshots.set(absPath, { content, fileExistedBefore });
       void this.store.save(this.snapshots);
-      this._onDidChangeDiffs.fire();
+      this._onDidChangeDiffs.fire(absPath);
     }
   }
 
@@ -200,7 +242,7 @@ export class DiffManager {
     if (nextTarget) {
       await this.openDiff(nextTarget);
     }
-    this._onDidChangeDiffs.fire();
+    this._onDidChangeDiffs.fire(absPath);
   }
 
   /**
@@ -237,7 +279,7 @@ export class DiffManager {
     if (nextTarget) {
       await this.openDiff(nextTarget);
     }
-    this._onDidChangeDiffs.fire();
+    this._onDidChangeDiffs.fire(absPath);
   }
 
   async acceptAllPending(): Promise<number> {
@@ -246,9 +288,13 @@ export class DiffManager {
     this.snapshots.clear();
     void this.store.save(this.snapshots);
     for (const p of pendingFiles) {
-      this.closePanel(normalizePath(p));
+      const absPath = normalizePath(p);
+      this.closePanel(absPath);
+      // Không dọn thì cursor cũ còn nằm lại vô thời hạn và sẽ được dùng lại cho
+      // lần pending sau của đúng file đó, nhảy về một vị trí không liên quan.
+      this.lastCursors.delete(absPath);
     }
-    this._onDidChangeDiffs.fire();
+    this._onDidChangeDiffs.fire(undefined);
     return count;
   }
 
@@ -286,6 +332,10 @@ export class DiffManager {
   }
 
   disposeAll(): void {
+    // Trước khi xoá: flush() serialise ngay tại đây (đồng bộ) nên vẫn bắt được
+    // nội dung hiện tại. Bỏ qua thì lần ghi đang chờ trong debounce mất luôn,
+    // và các diff đang chờ biến mất sau khi mở lại cửa sổ.
+    void this.store.flush();
     this.snapshots.clear();
     for (const panel of this.panels.values()) {
       panel.dispose();
@@ -392,7 +442,7 @@ export class DiffManager {
     const existing = this.panels.get(absPath);
     if (existing === panel) {
       this.panels.delete(absPath);
-      this._onDidChangeDiffs.fire();
+      this._onDidChangeDiffs.fire(absPath);
     }
   }
 
@@ -466,7 +516,7 @@ export class DiffManager {
     if (newOriginal === newCurrent) {
       await this.accept(absPath);
     } else {
-      this._onDidChangeDiffs.fire();
+      this._onDidChangeDiffs.fire(absPath);
     }
   }
 
@@ -505,7 +555,7 @@ export class DiffManager {
         await this.openDiff(nextTarget);
       }
     }
-    this._onDidChangeDiffs.fire();
+    this._onDidChangeDiffs.fire(absPath);
   }
 
   /**

@@ -67,6 +67,11 @@
           "minimum": 0,
           "markdownDescription": "Advanced: ignore files longer than this many lines — no baseline is kept and no diff tab ever opens for them. Set to `0` to disable the limit.\n\nDiff cost grows with the **square** of how many lines differ, so a large file that gets largely rewritten can block VS Code for seconds. Files that big are also almost always generated code, bundles or lock files rather than something reviewed hunk by hunk.\n\nWhy 5000: measured across `microsoft/vscode`, 99.8% of source files fall under it (median ~112 lines, p99 ~1980). Raise it if you genuinely review very large hand-written files — the TypeScript compiler's `checker.ts` is 54,433 lines — and accept that opening such a diff may stall the editor."
         },
+        "ai-cli-diff-view.respectGitignore": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Skip files that `.gitignore` excludes, so build output, logs and local-only files never enter the review queue.\n\nAsks `git check-ignore`, so nested `.gitignore` files, negations (`!keep.log`), `.git/info/exclude` and your global excludes file all behave exactly as they do in git. A file that is already **tracked** is never skipped, even if a pattern matches it.\n\nTurn this off if you want to review changes to ignored files too — `.env` is the common case."
+        },
         "ai-cli-diff-view.baselineScanConcurrency": {
           "type": "number",
           "default": 4,

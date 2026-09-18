@@ -253,7 +253,7 @@ export class ClaudeRunner implements IAiRunner {
         pendingToolUses.delete(toolEvent.tool_use_id);
         const basename = filePath.split(/[\\/]/).pop() ?? filePath;
         onProgress?.(`Opening diff: ${basename}`);
-        this.diffManager.openDiff(filePath).catch((err: unknown) => {
+        this.diffManager.openDiff(filePath, { auto: true }).catch((err: unknown) => {
           console.error('[ai-cli-diff-view] openDiff failed:', err);
         });
       }

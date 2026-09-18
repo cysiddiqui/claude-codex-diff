@@ -87,6 +87,18 @@ export class DiffEditorProvider implements vscode.CustomTextEditorProvider {
       });
     };
 
+    /**
+     * Chỉ đẩy con số "23 / 70" — dùng cho thay đổi xảy ra ở file KHÁC.
+     *
+     * Đường `postSet()` đầy đủ phải diff lại cả file rồi gửi kèm nguyên nội
+     * dung cả hai vế (đo được ~18 KB/tab), và phía webview `applySet()` dựng
+     * lại toàn bộ decoration + view zone của Monaco. Nhân lên số tab đang mở
+     * cho MỖI lần file bất kỳ đổi thì đó chính là chỗ IDE khựng lại.
+     */
+    const postNav = (): void => {
+      void webviewPanel.webview.postMessage({ type: 'nav', nav: this.computeNav(filePath) });
+    };
+
     let webviewReady = false;
     let pendingSet = false;
 
@@ -153,11 +165,20 @@ export class DiffEditorProvider implements vscode.CustomTextEditorProvider {
 
     // Snapshot đổi (accept hunk) hoặc pending list đổi -> refresh nav counter.
     disposables.push(
-      this.diffManager.onDidChangeDiffs(() => {
-        if (webviewReady) {
+      this.diffManager.onDidChangeDiffs((changedPath) => {
+        if (!webviewReady) {
+          pendingSet = true;
+          return;
+        }
+        // `undefined` = cả danh sách đổi (vd: accept all) -> ai cũng phải dựng
+        // lại. Ngược lại chỉ đúng tab của file đó cần diff lại; phần còn lại
+        // chỉ có mẫu số của counter là đổi.
+        const affectsThisFile =
+          changedPath === undefined || changedPath === normalizePath(filePath);
+        if (affectsThisFile) {
           postSet();
         } else {
-          pendingSet = true;
+          postNav();
         }
       })
     );

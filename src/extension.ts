@@ -5,6 +5,7 @@ import { IAiRunner } from './runner/aiRunner';
 import { WorkspaceWatcher } from './watcher/workspaceWatcher';
 import { refreshTextFileRules } from './watcher/fileTypeRules';
 import { refreshFileSizeLimit } from './watcher/fileSizeLimit';
+import { refreshGitIgnoreSetting } from './watcher/gitignore';
 import { GitBranchWatcher } from './watcher/gitBranchWatcher';
 import { registerAllCommands } from './commands/commandsRegistry';
 import { NavigationManager } from './diff/navigationManager';
@@ -14,6 +15,7 @@ import { TerminalPanelProvider } from './terminal/terminalPanel';
 export function activate(context: vscode.ExtensionContext): void {
   refreshTextFileRules();
   refreshFileSizeLimit();
+  refreshGitIgnoreSetting();
 
   const diffManager       = new DiffManager(context);
   const workspaceWatcher  = new WorkspaceWatcher(diffManager);
@@ -56,6 +58,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       if (e.affectsConfiguration('ai-cli-diff-view.maxFileLines')) {
         refreshFileSizeLimit();
+      }
+      if (e.affectsConfiguration('ai-cli-diff-view.respectGitignore')) {
+        refreshGitIgnoreSetting();
       }
     })
   );

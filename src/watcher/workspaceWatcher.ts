@@ -13,12 +13,14 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { DiffManager } from '../diff/diffManager';
+import { toLf } from '../diff/eol';
 import { BaselineScanner } from './baselineScanner';
 import { BaselineStore } from './baselineStore';
 import { isTextFile } from './fileTypeRules';
 import { isExcludedPathSegment } from './pathExclusions';
 import { exceedsLineLimit, exceedsSizeLimitByBytes } from './fileSizeLimit';
 import { BurstMeterConfig, WriteBurstMeter } from './writeBurstMeter';
+import { clearGitIgnoreCache, isGitIgnored } from './gitignore';
 
 export class WorkspaceWatcher {
   private disposables: vscode.Disposable[] = [];
@@ -123,10 +125,6 @@ export class WorkspaceWatcher {
     return process.platform === 'win32' ? fsPath.toLowerCase() : fsPath;
   }
 
-  private normalizeContent(content: string): string {
-    return content.trim().replace(/\r\n/g, '\n');
-  }
-
   /**
    * Sync snapshot khi VS Code save — đảm bảo FileSystemWatcher không trigger diff sai.
    * (onDidSaveTextDocument luôn fire trước watcher event)
@@ -140,7 +138,7 @@ export class WorkspaceWatcher {
       // để FileSystemWatcher không hiểu nhầm đây là external write.
       const text = doc.getText();
       if (exceedsLineLimit(text)) {
-        this.snapshots.markSizeSkipped(filePath);
+        this.snapshots.markSkipped(filePath);
       } else {
         this.snapshots.set(filePath, text);
       }
@@ -214,14 +212,23 @@ export class WorkspaceWatcher {
   private handleExternalWrite(uri: vscode.Uri, burstHoldOverride?: boolean): void {
     const absPath = this.normalizePath(uri.fsPath);
 
+    // Luật ignore vừa đổi -> mọi câu trả lời đã nhớ đều có thể sai. Đặt trước
+    // mọi early-return bên dưới để không bị chính các bộ lọc đó nuốt mất.
+    if (path.basename(absPath) === '.gitignore') { clearGitIgnoreCache(); }
+
     // Đo tốc độ ghi TRƯỚC mọi filter bên dưới — xem writeBurstMeter.ts. Capture
     // quyết định NGAY tại thời điểm raw event tới (chính xác nhất so với cửa
     // sổ trượt), mang theo qua debounce/setTimeout bên dưới tới lúc quyết định
     // triggerDiff — không gọi record() lần 2 để tránh đếm trùng.
     const burstHold = burstHoldOverride ?? this.burstMeter.record(absPath);
 
+    // Root phải resolve TRƯỚC: `isExcludedPathSegment()` chỉ đúng khi đọc đường
+    // tương đối so với project (xem pathExclusions.ts).
+    const workspaceRoot = this.workspaceRootFor(absPath);
+    if (workspaceRoot === undefined) { return; }
+
     // Bỏ qua dependency / build output / tooling (dotnet bin/obj, node_modules, …)
-    if (isExcludedPathSegment(absPath)) {
+    if (isExcludedPathSegment(absPath, workspaceRoot)) {
       return;
     }
 
@@ -240,7 +247,6 @@ export class WorkspaceWatcher {
     this.pruneStaleMapEntries();
 
     if (!isTextFile(path.basename(absPath))) { return; }
-    if (!this.isInWorkspace(absPath)) { return; }
 
     if (this.baselineScansInProgress > 0) {
       this.queuedExternalWrites.set(absPath, burstHold);
@@ -271,7 +277,7 @@ export class WorkspaceWatcher {
       // stat() cũng là phép kiểm tra file tồn tại; nếu file đã bị xóa, nó sẽ throw.
       const stat = await vscode.workspace.fs.stat(uri);
       if (exceedsSizeLimitByBytes(stat.size)) {
-        this.snapshots.markSizeSkipped(absPath);
+        this.snapshots.markSkipped(absPath);
         return;
       }
 
@@ -281,7 +287,7 @@ export class WorkspaceWatcher {
       // không giữ baseline, không mở diff. Xoá cả baseline cũ phòng khi file
       // vừa vượt ngưỡng (hoặc user vừa hạ setting xuống).
       if (exceedsLineLimit(newContentRaw)) {
-        this.snapshots.markSizeSkipped(absPath);
+        this.snapshots.markSkipped(absPath);
         return;
       }
 
@@ -292,10 +298,27 @@ export class WorkspaceWatcher {
         return;
       }
 
+      // File bị .gitignore loại thì không vào hàng chờ review. `markSkipped()`
+      // chứ không chỉ `return`: nếu sau này nó được gỡ khỏi .gitignore, "không
+      // có baseline" sẽ bị hiểu là file mới -> diff toàn-file-thêm-mới, và
+      // Revert all trên đó xoá mất file.
+      if (await isGitIgnored(absPath)) {
+        this.snapshots.markSkipped(absPath);
+        return;
+      }
+
       const oldContentRaw = this.snapshots.get(absPath);
 
-      const newContent = this.normalizeContent(newContentRaw);
-      const oldContent = oldContentRaw !== undefined ? this.normalizeContent(oldContentRaw) : undefined;
+      // So sánh trên LF thuần, KHÔNG trim: `trim()` nuốt mất mọi thay đổi chỉ
+      // đụng tới biên file (thêm/bớt newline cuối, bớt dòng trắng đầu file,
+      // cắt khoảng trắng thừa cuối file) — những thứ AI CLI sửa rất thường
+      // xuyên. Nuốt xong baseline vẫn bị ghi đè bên dưới, nên thay đổi đó biến
+      // mất vĩnh viễn, không bao giờ mở được diff để review.
+      //
+      // Cùng phép chuẩn hoá với `calculateHunks(toLf(...), toLf(...))` ở
+      // `openDiff()`, nên thay đổi thuần EOL vẫn cho 0 hunk như trước.
+      const newContent = toLf(newContentRaw);
+      const oldContent = oldContentRaw !== undefined ? toLf(oldContentRaw) : undefined;
 
       if (oldContent === undefined) {
         this.snapshots.set(absPath, newContentRaw);
@@ -303,7 +326,7 @@ export class WorkspaceWatcher {
         // nó KHÔNG phải file mới. Không có baseline cũ để so, nên chỉ nhận nội
         // dung hiện tại làm baseline rồi thôi. Mở diff ở đây sẽ hiện cả file là
         // "thêm mới", và Revert all trên diff đó sẽ xoá mất file.
-        if (this.snapshots.consumeSizeSkipped(absPath)) { return; }
+        if (this.snapshots.consumeSkipped(absPath)) { return; }
         if (newContent.trim()) {
           this.resolveOrHold(absPath, '', newContentRaw, false, burstHold);
         }
@@ -311,7 +334,7 @@ export class WorkspaceWatcher {
       }
 
       if (oldContent === newContent) {
-        // normalizeContent() bỏ qua EOL, nên nhánh này còn nuốt cả trường hợp
+        // toLf() bỏ qua EOL, nên nhánh này còn nuốt cả trường hợp
         // file chỉ đổi CRLF <-> LF. Phải refresh baseline raw trước khi thoát,
         // nếu không snapshot giữ EOL cũ vĩnh viễn và lần sửa 1 dòng kế tiếp sẽ
         // bị so lệch EOL -> diff phủ cả file (bug #15).
@@ -339,7 +362,9 @@ export class WorkspaceWatcher {
     fromBurstDump = false
   ): void {
     this.diffManager.loadSnapshot(filePath, originalContent, fileExistedBefore);
-    this.diffManager.openDiff(filePath, fromBurstDump ? { preserveFocus: true } : undefined).catch((err: unknown) => {
+    // `auto: true` — đây là đường AI ghi file, không phải user bấm mở. Xem
+    // DiffManager.openDiff(): đang review dở thì file mới chỉ vào hàng chờ.
+    this.diffManager.openDiff(filePath, { auto: true, preserveFocus: fromBurstDump }).catch((err: unknown) => {
       console.error('[ai-cli-diff-view] workspaceWatcher openDiff failed:', err);
     });
   }
@@ -394,11 +419,32 @@ export class WorkspaceWatcher {
     }, this.holdMs);
   }
 
-  private isInWorkspace(filePath: string): boolean {
+  /**
+   * Workspace folder chứa file này, hoặc undefined nếu nó nằm ngoài workspace.
+   *
+   * So khớp theo RANH GIỚI segment chứ không phải `startsWith` trần: với root
+   * `/home/me/proj`, một `startsWith` sẽ nhận nhầm cả `/home/me/proj-backup/x.ts`.
+   *
+   * Trả về chính root (chưa normalize) vì `isExcludedPathSegment()` cần nó để
+   * đọc đường tương đối so với project.
+   */
+  private workspaceRootFor(filePath: string): string | undefined {
     const folders = vscode.workspace.workspaceFolders;
-    if (!folders) { return false; }
+    if (!folders) { return undefined; }
     const normalizedPath = this.normalizePath(filePath);
-    return folders.some(f => normalizedPath.startsWith(this.normalizePath(f.uri.fsPath)));
+    let best: { root: string; length: number } | undefined;
+    for (const folder of folders) {
+      const root = this.normalizePath(folder.uri.fsPath);
+      const contained =
+        normalizedPath === root ||
+        normalizedPath.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+      // Workspace lồng nhau: lấy root khớp DÀI NHẤT, để đường tương đối được
+      // tính so với project gần nhất.
+      if (contained && (best === undefined || root.length > best.length)) {
+        best = { root: folder.uri.fsPath, length: root.length };
+      }
+    }
+    return best?.root;
   }
 
   /** Cập nhật snapshot khi người dùng tự sửa file (để baseline luôn đúng) */
@@ -419,5 +465,7 @@ export class WorkspaceWatcher {
     }
     this.heldWrites.clear();
     this.queuedExternalWrites.clear();
+    this.lastProcessed.clear();
+    this.savedFilesByVsCode.clear();
   }
 }
