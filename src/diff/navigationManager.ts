@@ -32,12 +32,12 @@ export class NavigationManager {
       return;
     }
 
-    // Diff tab là CustomTextEditor (webview), KHÔNG phải TextEditor — nên
+    // Diff hiển thị trong một webview panel, KHÔNG phải TextEditor — nên
     // `activeTextEditor` là undefined (hoặc còn trỏ vào một text tab cũ ở group
     // khác) đúng lúc user đang xem diff. Hệ quả cũ: `indexOf` luôn trả -1, Next
     // luôn nhảy về file pending đầu tiên và Prev về file cuối, bấm bao nhiêu lần
-    // cũng vậy. `getActiveFilePath()` đọc TabInputCustom nên nhận ra đúng diff
-    // đang mở; activeTextEditor chỉ còn là fallback cho text tab thường.
+    // cũng vậy. `getActiveFilePath()` hỏi thẳng panel host nên biết đúng file
+    // đang hiển thị; activeTextEditor chỉ còn là fallback cho text tab thường.
     const activeEditor = vscode.window.activeTextEditor;
     const currentPath =
       this.diffManager.getActiveFilePath() ??

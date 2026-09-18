@@ -54,6 +54,10 @@ export class WorkspaceWatcher {
   private lastAutoOpenActivityAt = 0;
   /** Khoảng cách tối thiểu giữa 2 write để coi là 2 cụm khác nhau (và ghi lại hint activeTab mới). */
   private static readonly ACTIVE_TAB_CAPTURE_GAP_MS = 500;
+  /** File pending vừa nhận event xoá, đang chờ xác nhận là mất thật. */
+  private readonly pendingDeletions = new Map<string, NodeJS.Timeout>();
+  /** Đợi bấy nhiêu ms rồi mới tin một event xoá — xem handleExternalDelete(). */
+  private static readonly DELETE_CONFIRM_MS = 500;
 
   constructor(private readonly diffManager: DiffManager) {
     this.snapshots = new BaselineStore();
@@ -175,6 +179,9 @@ export class WorkspaceWatcher {
     
     fileWatcher.onDidChange(handleUri);
     fileWatcher.onDidCreate(handleUri);
+    fileWatcher.onDidDelete((uri) => {
+      this.handleExternalDelete(uri);
+    });
     
     this.disposables.push(fileWatcher);
 
@@ -211,6 +218,9 @@ export class WorkspaceWatcher {
 
   private handleExternalWrite(uri: vscode.Uri, burstHoldOverride?: boolean): void {
     const absPath = this.normalizePath(uri.fsPath);
+    // File quay lại trước khi event xoá kịp được xác nhận (ghi kiểu temp +
+    // rename) -> huỷ luôn, snapshot phải được giữ nguyên.
+    this.cancelPendingDeletion(absPath);
 
     // Luật ignore vừa đổi -> mọi câu trả lời đã nhớ đều có thể sai. Đặt trước
     // mọi early-return bên dưới để không bị chính các bộ lọc đó nuốt mất.
@@ -452,6 +462,49 @@ export class WorkspaceWatcher {
     this.snapshots.set(this.normalizePath(filePath), content);
   }
 
+  /**
+   * File bị xoá khỏi đĩa. Nếu nó đang có diff pending thì snapshot phải được bỏ
+   * đi, nếu không pending list giữ lại một file không còn tồn tại.
+   *
+   * Không bỏ ngay: rất nhiều tool ghi file bằng temp + rename, nên watcher bắn
+   * `delete` rồi `create` ngay sau đó. Bỏ snapshot ở nhịp `delete` sẽ biến lần
+   * ghi ấy thành "file mới" và diff hiện nguyên cả file thay vì đúng phần sửa.
+   * Đợi xác nhận file thật sự không còn rồi mới bỏ.
+   */
+  private handleExternalDelete(uri: vscode.Uri): void {
+    const absPath = this.normalizePath(uri.fsPath);
+    if (!this.diffManager.hasPendingDiff(absPath)) { return; }
+
+    this.cancelPendingDeletion(absPath);
+
+    const timer = setTimeout(() => {
+      this.pendingDeletions.delete(absPath);
+      this.pendingTimers.delete(timer);
+      void this.confirmDeletion(absPath);
+    }, WorkspaceWatcher.DELETE_CONFIRM_MS);
+    this.pendingDeletions.set(absPath, timer);
+    this.pendingTimers.add(timer);
+  }
+
+  private async confirmDeletion(absPath: string): Promise<void> {
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.file(absPath));
+      // File đã quay lại — đó là một lần ghi, không phải xoá.
+      return;
+    } catch {
+      // Đọc stat không được = mất thật.
+    }
+    await this.diffManager.dropDeletedFile(absPath);
+  }
+
+  private cancelPendingDeletion(absPath: string): void {
+    const timer = this.pendingDeletions.get(absPath);
+    if (!timer) { return; }
+    clearTimeout(timer);
+    this.pendingDeletions.delete(absPath);
+    this.pendingTimers.delete(timer);
+  }
+
   dispose(): void {
     for (const d of this.disposables) { d.dispose(); }
     this.disposables = [];
@@ -464,6 +517,7 @@ export class WorkspaceWatcher {
       this.holdResolveTimer = undefined;
     }
     this.heldWrites.clear();
+    this.pendingDeletions.clear();
     this.queuedExternalWrites.clear();
     this.lastProcessed.clear();
     this.savedFilesByVsCode.clear();

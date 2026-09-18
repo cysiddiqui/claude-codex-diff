@@ -2,8 +2,8 @@
  * diffManager.ts
  *
  * Snapshot + accept/revert state cho các file đang được AI sửa.
- * Render delegate hoàn toàn sang DiffEditorProvider (CustomTextEditorProvider).
- * Mỗi pending file = 1 tab webview riêng.
+ * Render delegate hoàn toàn sang DiffPanelHost — MỘT webview dùng chung cho
+ * mọi pending file, đổi nội dung thay vì mở tab mới (xem diffWebviewPanel.ts).
  */
 
 import * as fs from 'fs';
@@ -13,7 +13,7 @@ import { calculateHunks } from './hunkCalculator';
 import { detectEol, fromLf, toLf } from './eol';
 import { exceedsLineLimit } from '../watcher/fileSizeLimit';
 import { isGitIgnored } from '../watcher/gitignore';
-import { DIFF_EDITOR_VIEW_TYPE } from './diffWebviewPanel';
+import type { DiffPanelHost } from './diffWebviewPanel';
 import { SnapshotStore, SnapshotState } from './snapshotStore';
 
 function normalizePath(filePath: string): string {
@@ -53,8 +53,8 @@ export class DiffManager {
 
   private snapshots: Map<string, SnapshotState> = new Map();
   private readonly store: SnapshotStore;
-  /** filePath (normalized) -> active webview panel. */
-  private panels: Map<string, vscode.WebviewPanel> = new Map();
+  /** Panel diff duy nhất. Gắn sau khi construct vì hai bên tham chiếu nhau. */
+  private host: DiffPanelHost | undefined;
   /** filePath (normalized) -> last cursor + top visible line seen in Monaco modified editor. */
   private lastCursors: Map<string, { line: number; column: number; topLine?: number }> = new Map();
 
@@ -79,6 +79,10 @@ export class DiffManager {
   constructor(private readonly context: vscode.ExtensionContext) {
     this.store = new SnapshotStore(context.workspaceState);
     this.snapshots = this.store.load();
+  }
+
+  attachPanelHost(host: DiffPanelHost): void {
+    this.host = host;
   }
 
   async snapshotBefore(filePath: string): Promise<void> {
@@ -157,13 +161,15 @@ export class DiffManager {
 
     const isAuto = options?.auto === true;
 
-    const existing = this.panels.get(absPath);
-    if (existing) {
-      // Tab của chính file này đã mở: webview tự refresh qua
+    const host = this.host;
+    if (!host) { return; }
+
+    if (host.activeFilePath === absPath) {
+      // Panel đã hiển thị đúng file này; nội dung tự refresh qua
       // onDidChangeTextDocument, nên lần auto không cần reveal — user có thể
-      // đang đọc một diff khác.
+      // đang đọc chỗ khác.
       if (!isAuto) {
-        existing.reveal(vscode.ViewColumn.Active, preserveFocus);
+        await host.show(absPath, { preserveFocus });
       }
       this._onDidChangeDiffs.fire(absPath);
       return;
@@ -172,19 +178,13 @@ export class DiffManager {
     // Đang có diff mở = user đang review dở. Edit mới chỉ vào hàng chờ.
     // Lưu ý thứ tự: đoạn tính hunk ở trên vẫn chạy trước, nên file "sửa rồi
     // thành y hệt cũ" vẫn bị dọn khỏi pending thay vì đọng lại làm lệch counter.
-    if (isAuto && this.panels.size > 0) {
+    if (isAuto && host.hasPanel()) {
       this._onDidChangeDiffs.fire(absPath);
       return;
     }
 
     await this.closeTextTabsFor(absPath);
-
-    await vscode.commands.executeCommand(
-      'vscode.openWith',
-      vscode.Uri.file(canonicalCasePath(absPath)),
-      DIFF_EDITOR_VIEW_TYPE,
-      { preview: false, preserveFocus } satisfies vscode.TextDocumentShowOptions
-    );
+    await host.show(absPath, { preserveFocus });
     this._onDidChangeDiffs.fire(absPath);
   }
 
@@ -236,12 +236,17 @@ export class DiffManager {
 
     this.snapshots.delete(absPath);
     void this.store.save(this.snapshots);
-    this.closePanel(absPath);
+    // Tháo file khỏi panel nhưng GIỮ webview sống: openDiff() ngay dưới dùng
+    // lại đúng panel đó. Dispose rồi tạo lại = nạp lại Monaco.
+    this.host?.detachIfShowing(absPath);
     await this.reopenAsTextEditor(absPath);
 
     if (nextTarget) {
       await this.openDiff(nextTarget);
     }
+    // openDiff() có thể không gắn được gì (file kế tiếp hoá ra 0 hunk nên bị
+    // dọn khỏi pending luôn). Còn detached nghĩa là không còn gì để xem.
+    this.host?.closeIfDetached();
     this._onDidChangeDiffs.fire(absPath);
   }
 
@@ -269,7 +274,7 @@ export class DiffManager {
 
     this.snapshots.delete(absPath);
     void this.store.save(this.snapshots);
-    this.closePanel(absPath);
+    this.host?.detachIfShowing(absPath);
     if (snapshot.fileExistedBefore) {
       await this.reopenAsTextEditor(absPath);
     } else {
@@ -279,6 +284,7 @@ export class DiffManager {
     if (nextTarget) {
       await this.openDiff(nextTarget);
     }
+    this.host?.closeIfDetached();
     this._onDidChangeDiffs.fire(absPath);
   }
 
@@ -287,15 +293,49 @@ export class DiffManager {
     const count = pendingFiles.length;
     this.snapshots.clear();
     void this.store.save(this.snapshots);
+    this.host?.close();
     for (const p of pendingFiles) {
-      const absPath = normalizePath(p);
-      this.closePanel(absPath);
       // Không dọn thì cursor cũ còn nằm lại vô thời hạn và sẽ được dùng lại cho
       // lần pending sau của đúng file đó, nhảy về một vị trí không liên quan.
-      this.lastCursors.delete(absPath);
+      this.lastCursors.delete(normalizePath(p));
     }
     this._onDidChangeDiffs.fire(undefined);
     return count;
+  }
+
+  /**
+   * File đang pending vừa bị xoá khỏi đĩa -> bỏ snapshot đi.
+   *
+   * Không có bước này thì file đã xoá vẫn nằm trong pending list: counter đếm
+   * sai (hiện `2 / 22` trong khi chỉ còn 2 file thật), và next/prev vẫn dừng ở
+   * những mục đó — `openDiff()` đọc file không được nên im lặng `return`, nút
+   * bấm như không có tác dụng.
+   */
+  async dropDeletedFile(filePath: string): Promise<boolean> {
+    const absPath = normalizePath(filePath);
+    if (!this.snapshots.has(absPath)) { return false; }
+
+    const wasShowing = this.host?.activeFilePath === absPath;
+    const pendingBefore = this.getPendingFiles();
+    const currentIdx = pendingBefore.findIndex(p => normalizePath(p) === absPath);
+    const nextTarget =
+      pendingBefore.length > 1 && currentIdx !== -1
+        ? pendingBefore[(currentIdx + 1) % pendingBefore.length]
+        : undefined;
+
+    this.snapshots.delete(absPath);
+    void this.store.save(this.snapshots);
+    this.lastCursors.delete(absPath);
+    this.host?.detachIfShowing(absPath);
+
+    if (wasShowing) {
+      if (nextTarget) {
+        await this.openDiff(nextTarget);
+      }
+      this.host?.closeIfDetached();
+    }
+    this._onDidChangeDiffs.fire(absPath);
+    return true;
   }
 
   hasPendingDiff(filePath: string): boolean {
@@ -310,7 +350,7 @@ export class DiffManager {
     return this.snapshots.get(normalizePath(filePath))?.content;
   }
 
-  /** Alias dùng bởi DiffEditorProvider; trả về content của snapshot (left side). */
+  /** Alias dùng bởi DiffPanelHost; trả về content của snapshot (left side). */
   getSnapshotContent(filePath: string): string | undefined {
     return this.getSnapshot(filePath);
   }
@@ -319,16 +359,9 @@ export class DiffManager {
     this.lastCursors.set(normalizePath(filePath), { line, column, topLine });
   }
 
+  /** Chỉ còn một panel, nên "diff nào đang mở" là câu hỏi thẳng. */
   getActiveFilePath(): string | undefined {
-    const active = vscode.window.tabGroups.activeTabGroup.activeTab;
-    if (active?.input instanceof vscode.TabInputCustom) {
-      if (active.input.viewType === DIFF_EDITOR_VIEW_TYPE) {
-        return normalizePath(active.input.uri.fsPath);
-      }
-    }
-    // Fallback: first panel in map.
-    const first = this.panels.keys().next();
-    return first.done ? undefined : first.value;
+    return this.host?.activeFilePath;
   }
 
   disposeAll(): void {
@@ -337,10 +370,7 @@ export class DiffManager {
     // và các diff đang chờ biến mất sau khi mở lại cửa sổ.
     void this.store.flush();
     this.snapshots.clear();
-    for (const panel of this.panels.values()) {
-      panel.dispose();
-    }
-    this.panels.clear();
+    this.host?.close();
   }
 
   /**
@@ -367,12 +397,9 @@ export class DiffManager {
   }
 
   private getLiveActiveDiffPath(): string | undefined {
-    const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
-    return activeTab?.input instanceof vscode.TabInputCustom &&
-      activeTab.input.viewType === DIFF_EDITOR_VIEW_TYPE &&
-      this.panels.has(normalizePath(activeTab.input.uri.fsPath))
-        ? normalizePath(activeTab.input.uri.fsPath)
-        : undefined;
+    if (this.host?.isActiveTab() !== true) { return undefined; }
+    const active = this.host.activeFilePath;
+    return active !== undefined && this.snapshots.has(active) ? active : undefined;
   }
 
   /**
@@ -390,6 +417,9 @@ export class DiffManager {
   }
 
   private getCurrentTabFsPath(): string | undefined {
+    // Tab diff là webview panel, không phải tab file — tabGroups không cho ra
+    // path của nó, phải hỏi thẳng host.
+    if (this.host?.isActiveTab() === true) { return this.host.activeFilePath; }
     const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
     const uri =
       tab?.input instanceof vscode.TabInputText ? tab.input.uri :
@@ -412,46 +442,6 @@ export class DiffManager {
       return { captured: false, path: undefined };
     }
     return { captured, path };
-  }
-
-  // ---- Panel registry (gọi bởi DiffEditorProvider) ----
-
-  registerPanel(filePath: string, panel: vscode.WebviewPanel): void {
-    const absPath = normalizePath(filePath);
-
-    // openDiff() là async (await vscode.openWith) — nếu clearAll()/disposeAll()
-    // chạy xong TRƯỚC khi tab này kịp mở (vd: git branch confirm ngay giữa lúc
-    // đang mở), snapshot đã bị xoá nhưng panel này chưa kịp đăng ký nên không
-    // bị đóng theo. Không có gì để diff nữa — đóng luôn ở đây (đồng bộ, sớm
-    // hơn nhiều so với việc chờ webview Monaco load xong rồi tự đóng qua
-    // postSet()).
-    if (!this.snapshots.has(absPath)) {
-      panel.dispose();
-      return;
-    }
-
-    const existing = this.panels.get(absPath);
-    if (existing && existing !== panel) {
-      existing.dispose();
-    }
-    this.panels.set(absPath, panel);
-  }
-
-  unregisterPanel(filePath: string, panel: vscode.WebviewPanel): void {
-    const absPath = normalizePath(filePath);
-    const existing = this.panels.get(absPath);
-    if (existing === panel) {
-      this.panels.delete(absPath);
-      this._onDidChangeDiffs.fire(absPath);
-    }
-  }
-
-  private closePanel(absPath: string): void {
-    const panel = this.panels.get(absPath);
-    if (panel) {
-      this.panels.delete(absPath);
-      panel.dispose();
-    }
   }
 
   private async reopenAsTextEditor(absPath: string): Promise<void> {
@@ -549,11 +539,12 @@ export class DiffManager {
 
       this.snapshots.delete(absPath);
       void this.store.save(this.snapshots);
-      this.closePanel(absPath);
+      this.host?.detachIfShowing(absPath);
 
       if (nextTarget) {
         await this.openDiff(nextTarget);
       }
+      this.host?.closeIfDetached();
     }
     this._onDidChangeDiffs.fire(absPath);
   }

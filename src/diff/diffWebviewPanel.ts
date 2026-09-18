@@ -2,222 +2,404 @@
  * diffWebviewPanel.ts
  *
  * Cursor-style diff editor.
- * Implemented as a CustomTextEditorProvider — mỗi pending file mở trong 1 tab riêng,
- * render Monaco DiffEditor (inline) trong webview. Snapshot lưu trong DiffManager
- * (left side), TextDocument cung cấp modified content (right side).
+ *
+ * MỘT webview duy nhất cho MỌI file pending, không phải một tab cho mỗi file.
+ *
+ * Bản cũ dùng CustomTextEditorProvider: mỗi pending file mở một tab riêng, tức
+ * một webview riêng, tức Monaco phải nạp lại từ đầu — ~3.8 MB (loader, 3.5 MB
+ * `editor.main.js`, nls, css) kéo qua remote connection rồi parse lại. Bấm
+ * next/prev qua 20 file là 20 lần nạp Monaco. Đó là toàn bộ độ trễ 1–2 giây.
+ *
+ * Giữ một panel sống (`retainContextWhenHidden`) và chỉ đổi NỘI DUNG bên trong
+ * thì Monaco nạp đúng một lần mỗi session; chuyển file chỉ còn là một
+ * postMessage + tính hunk, tính bằng mili giây. `applySet()` phía webview vốn
+ * đã xử lý được việc đổi sang file khác (`isSameFile` sai -> dispose model cũ,
+ * tạo model mới) — trước giờ không đường nào gọi tới nhánh đó.
+ *
+ * Đánh đổi: mỗi lần chỉ xem được một diff. Đó đúng là cách Cursor làm.
+ *
+ * Snapshot (vế trái) nằm ở DiffManager; TextDocument của file cho vế phải.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { DiffManager } from './diffManager';
 import { calculateHunks } from './hunkCalculator';
 import { fromLf, toLf } from './eol';
 
-export const DIFF_EDITOR_VIEW_TYPE = 'ai-cli-diff-view.diffEditor';
+/** viewType của panel. KHÁC id custom editor cũ, để tab cũ còn sót không cố khôi phục vào đây. */
+export const DIFF_PANEL_VIEW_TYPE = 'ai-cli-diff-view.diffPanel';
 
+/** Key lưu file đang hiển thị, để serializer khôi phục đúng file sau khi reload window. */
+const LAST_SHOWN_KEY = 'ai-cli-diff-view.lastShownDiff';
+
+/**
+ * Mọi message từ webview đều kèm `filePath` của file nó ĐANG hiển thị.
+ *
+ * Bắt buộc từ khi dùng chung một webview: bấm Accept rồi bấm next thật nhanh
+ * thì message Accept có thể tới sau khi panel đã đổi sang file khác, và nếu
+ * chỉ đọc "file hiện tại" thì ta accept nhầm file. Path đi kèm message cho
+ * phép bỏ qua những message đã lỗi thời.
+ */
 type IncomingMsg =
   | { type: 'ready' }
-  | { type: 'acceptHunk'; newOriginal: string; newCurrent: string }
-  | { type: 'rejectHunk'; newOriginal: string; newCurrent: string }
-  | { type: 'editModified'; newCurrent: string }
-  | { type: 'acceptAll' }
-  | { type: 'rejectAll' }
-  | { type: 'nextFile' }
-  | { type: 'prevFile' }
-  | { type: 'save' }
+  | { type: 'acceptHunk'; filePath?: string; newOriginal: string; newCurrent: string }
+  | { type: 'rejectHunk'; filePath?: string; newOriginal: string; newCurrent: string }
+  | { type: 'editModified'; filePath?: string; newCurrent: string }
+  | { type: 'acceptAll'; filePath?: string }
+  | { type: 'rejectAll'; filePath?: string }
+  | { type: 'nextFile'; filePath?: string }
+  | { type: 'prevFile'; filePath?: string }
+  | { type: 'save'; filePath?: string }
   | { type: 'undo' }
   | { type: 'redo' }
-  | { type: 'cursor'; line: number; column: number; topLine?: number };
+  | { type: 'cursor'; filePath?: string; line: number; column: number; topLine?: number };
 
-export class DiffEditorProvider implements vscode.CustomTextEditorProvider {
+export class DiffPanelHost {
+  private panel: vscode.WebviewPanel | undefined;
+  /** File đang hiển thị (đã normalize). `undefined` = panel còn sống nhưng chưa gắn file nào. */
+  private currentPath: string | undefined;
+  private currentDoc: vscode.TextDocument | undefined;
+  private webviewReady = false;
+  private pendingSet = false;
+  /** Disposable theo vòng đời của PANEL, dọn khi panel bị dispose. */
+  private panelDisposables: vscode.Disposable[] = [];
+
   constructor(
     private readonly extensionUri: vscode.Uri,
-    private readonly diffManager: DiffManager
+    private readonly diffManager: DiffManager,
+    private readonly context: vscode.ExtensionContext
   ) {}
 
-  async resolveCustomTextEditor(
-    document: vscode.TextDocument,
-    webviewPanel: vscode.WebviewPanel,
-    _token: vscode.CancellationToken
-  ): Promise<void> {
-    const filePath = document.uri.fsPath;
+  /** File đang hiển thị, hoặc `undefined` nếu không có panel / chưa gắn file. */
+  get activeFilePath(): string | undefined {
+    return this.panel ? this.currentPath : undefined;
+  }
+
+  hasPanel(): boolean {
+    return this.panel !== undefined;
+  }
+
+  /** Tab diff có đang là tab active của window không. */
+  isActiveTab(): boolean {
+    return this.panel?.active === true;
+  }
+
+  /**
+   * Hiển thị `filePath`. Tạo panel ở lần đầu; các lần sau chỉ đổi nội dung —
+   * đó chính là chỗ tiết kiệm được một lần nạp Monaco.
+   */
+  async show(filePath: string, options?: { preserveFocus?: boolean }): Promise<void> {
+    const absPath = normalizePath(filePath);
+    const preserveFocus = options?.preserveFocus === true;
+    const isNewPanel = this.panel === undefined;
+
+    // Dựng panel TRƯỚC khi đọc document. Panel vừa tạo là webview bắt đầu kéo
+    // ~3.8 MB Monaco ngay lập tức; đọc document chạy song song với nó. Làm
+    // ngược lại (await document rồi mới tạo panel) là nối đuôi hai việc vốn
+    // chồng lên nhau được — `vscode.openWith` của bản custom editor cũ vẫn
+    // chồng, nên đảo thứ tự là tự làm lần mở đầu tiên chậm đi.
+    if (isNewPanel) {
+      this.createPanel(preserveFocus);
+    }
+
+    let doc: vscode.TextDocument;
+    const tDoc = Date.now();
+    try {
+      doc = await vscode.workspace.openTextDocument(
+        vscode.Uri.file(canonicalCasePath(absPath))
+      );
+      console.log(
+        '[ai-cli-diff TIMING ext] openTextDocument ' + (Date.now() - tDoc) + 'ms ' +
+        (isNewPanel ? '(overlapped with Monaco load)' : '(panel reused)')
+      );
+    } catch (err) {
+      console.error('[ai-cli-diff] cannot open document for diff:', err);
+      // Panel vừa tạo cho lần mở hỏng này thì đừng để lại tab rỗng.
+      if (isNewPanel) { this.close(); }
+      return;
+    }
+    // Panel có thể đã bị đóng trong lúc chờ đọc document.
+    if (!this.panel) { return; }
+
+    this.currentPath = absPath;
+    this.currentDoc = doc;
+    this.panel.title = path.basename(absPath);
+    void this.context.workspaceState.update(LAST_SHOWN_KEY, absPath);
+
+    if (!isNewPanel) {
+      this.panel.reveal(this.panel.viewColumn ?? vscode.ViewColumn.Active, preserveFocus);
+    }
+    // Panel mới: Monaco chưa dựng xong, `ready` sẽ gọi postSet().
+    // Panel cũ (hoặc `ready` đã tới trong lúc chờ document): đẩy nội dung luôn.
+    if (this.webviewReady) {
+      this.postSet();
+    }
+  }
+
+  /**
+   * File đang hiển thị vừa rời pending list (accept / revert / bị xoá).
+   * Giữ webview sống — caller thường `show()` file kế tiếp ngay sau đó, và
+   * dispose rồi tạo lại chính là thứ đang phải tránh.
+   */
+  detachIfShowing(filePath: string): void {
+    if (this.currentPath !== normalizePath(filePath)) { return; }
+    this.currentPath = undefined;
+    this.currentDoc = undefined;
+  }
+
+  /** Không còn file nào để hiển thị -> đóng hẳn tab. */
+  closeIfDetached(): void {
+    if (this.panel && this.currentPath === undefined) {
+      this.close();
+    }
+  }
+
+  close(): void {
+    this.panel?.dispose();
+  }
+
+  /**
+   * Khôi phục panel sau khi reload window (registerWebviewPanelSerializer).
+   * File cũ không còn pending thì đóng luôn, không để lại một tab rỗng.
+   */
+  adopt(panel: vscode.WebviewPanel): void {
+    if (this.panel && this.panel !== panel) {
+      this.panel.dispose();
+    }
+    this.panel = panel;
+    this.wirePanel(panel);
+
+    const last = this.context.workspaceState.get<string>(LAST_SHOWN_KEY);
+    if (!last || !this.diffManager.hasPendingDiff(last)) {
+      panel.dispose();
+      return;
+    }
+    void this.show(last, { preserveFocus: true });
+  }
+
+  private createPanel(preserveFocus: boolean): void {
+    const panel = vscode.window.createWebviewPanel(
+      DIFF_PANEL_VIEW_TYPE,
+      'AI CLI Diff',
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus },
+      {
+        enableScripts: true,
+        localResourceRoots: this.resourceRoots(),
+        // Không giữ thì mỗi lần chuyển tab là một lần nạp lại Monaco — đúng
+        // cái đang sửa. Chỉ có MỘT panel nên chi phí bộ nhớ là cố định.
+        retainContextWhenHidden: true,
+      }
+    );
+    this.panel = panel;
+    // Options đã truyền lúc tạo — gán lại `webview.options` sẽ reset webview.
+    this.wirePanel(panel, { setOptions: false });
+  }
+
+  private resourceRoots(): vscode.Uri[] {
+    return [
+      vscode.Uri.joinPath(this.extensionUri, 'node_modules', 'monaco-editor', 'min'),
+      vscode.Uri.joinPath(this.extensionUri, 'res', 'webview'),
+    ];
+  }
+
+  /** Gắn html + toàn bộ listener. Chạy một lần mỗi PANEL, không phải mỗi file. */
+  private wirePanel(panel: vscode.WebviewPanel, opts?: { setOptions?: boolean }): void {
     const t0 = Date.now();
     const tlog = (label: string): void => {
       console.log('[ai-cli-diff TIMING ext] +' + (Date.now() - t0) + 'ms ' + label);
     };
-    tlog('resolveCustomTextEditor entry');
-    const monacoRoot = vscode.Uri.joinPath(this.extensionUri, 'node_modules', 'monaco-editor', 'min');
-    const resRoot = vscode.Uri.joinPath(this.extensionUri, 'res', 'webview');
+    tlog('panel created');
 
-    webviewPanel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [monacoRoot, resRoot],
-    };
-    webviewPanel.webview.html = this.buildHtml(webviewPanel.webview);
+    this.webviewReady = false;
+    this.pendingSet = false;
+
+    if (opts?.setOptions !== false) {
+      panel.webview.options = {
+        enableScripts: true,
+        localResourceRoots: this.resourceRoots(),
+      };
+    }
+    panel.webview.html = this.buildHtml(panel.webview);
     tlog('webview.html assigned');
 
-    this.diffManager.registerPanel(filePath, webviewPanel);
+    const d = this.panelDisposables;
 
-    const disposables: vscode.Disposable[] = [];
-
-    const postSet = (): void => {
-      const snapshot = this.diffManager.getSnapshotContent(filePath);
-      if (snapshot === undefined) {
-        // Snapshot bị xóa (vd: accept-all). Đóng tab.
-        webviewPanel.dispose();
-        return;
-      }
-      // Webview sống hoàn toàn trong LF: nó splice/join lại nội dung bằng '\n'
-      // (diff.monaco.js) rồi gửi ngược về, nên hai vế phải cùng ở LF thuần.
-      // EOL thật được khôi phục ở applyModifiedEdit() / DiffManager.writeFile().
-      const originalContent = toLf(snapshot);
-      const currentContent = toLf(document.getText());
-      const hunks = calculateHunks(originalContent, currentContent);
-      const nav = this.computeNav(filePath);
-      void webviewPanel.webview.postMessage({
-        type: 'set',
-        filePath,
-        language: detectLanguageId(filePath),
-        originalContent,
-        currentContent,
-        hunks,
-        theme: currentMonacoTheme(),
-        editorConfig: readEditorConfig(),
-        nav,
-      });
-    };
-
-    /**
-     * Chỉ đẩy con số "23 / 70" — dùng cho thay đổi xảy ra ở file KHÁC.
-     *
-     * Đường `postSet()` đầy đủ phải diff lại cả file rồi gửi kèm nguyên nội
-     * dung cả hai vế (đo được ~18 KB/tab), và phía webview `applySet()` dựng
-     * lại toàn bộ decoration + view zone của Monaco. Nhân lên số tab đang mở
-     * cho MỖI lần file bất kỳ đổi thì đó chính là chỗ IDE khựng lại.
-     */
-    const postNav = (): void => {
-      void webviewPanel.webview.postMessage({ type: 'nav', nav: this.computeNav(filePath) });
-    };
-
-    let webviewReady = false;
-    let pendingSet = false;
-
-    disposables.push(
-      webviewPanel.webview.onDidReceiveMessage(async (msg: IncomingMsg) => {
+    d.push(
+      panel.webview.onDidReceiveMessage(async (msg: IncomingMsg) => {
         if (msg.type === 'ready') {
-          webviewReady = true;
+          this.webviewReady = true;
           tlog('received ready from webview');
-          postSet();
-          tlog('postSet (set message sent) done');
+          this.postSet();
           return;
         }
+        if (msg.type === 'undo') {
+          await vscode.commands.executeCommand('undo');
+          return;
+        }
+        if (msg.type === 'redo') {
+          await vscode.commands.executeCommand('redo');
+          return;
+        }
+
+        // Message nói về một file khác với file đang hiển thị = đã lỗi thời
+        // (user chuyển file trước khi message kịp tới). Bỏ qua, đừng ghi nhầm.
+        const target = this.resolveTarget(msg.filePath);
+        if (target === undefined) { return; }
+
         switch (msg.type) {
           case 'acceptHunk':
-            await this.diffManager.applyHunkAcceptFromWebview(filePath, msg.newOriginal, msg.newCurrent);
+            await this.diffManager.applyHunkAcceptFromWebview(target, msg.newOriginal, msg.newCurrent);
             return;
           case 'rejectHunk':
-            await this.diffManager.applyHunkRejectFromWebview(filePath, msg.newOriginal, msg.newCurrent);
+            await this.diffManager.applyHunkRejectFromWebview(target, msg.newOriginal, msg.newCurrent);
             return;
           case 'editModified':
-            await this.applyModifiedEdit(document, msg.newCurrent);
+            await this.applyModifiedEdit(target, msg.newCurrent);
             return;
           case 'acceptAll':
-            await this.diffManager.accept(filePath);
+            await this.diffManager.accept(target);
             return;
           case 'rejectAll':
-            await this.diffManager.revert(filePath);
+            await this.diffManager.revert(target);
             return;
           case 'nextFile':
-            await this.gotoSibling(filePath, +1);
+            await this.gotoSibling(target, +1);
             return;
           case 'prevFile':
-            await this.gotoSibling(filePath, -1);
+            await this.gotoSibling(target, -1);
             return;
           case 'save':
-            await document.save();
-            return;
-          case 'undo':
-            await vscode.commands.executeCommand('undo');
-            return;
-          case 'redo':
-            await vscode.commands.executeCommand('redo');
+            await this.currentDoc?.save();
             return;
           case 'cursor':
-            this.diffManager.setLastCursor(filePath, msg.line, msg.column, msg.topLine);
+            this.diffManager.setLastCursor(target, msg.line, msg.column, msg.topLine);
             return;
         }
       })
     );
 
-    // Khi file đổi (AI ghi, user edit, accept hunk update snapshot...), repost.
-    disposables.push(
+    // File đang hiển thị đổi nội dung (AI ghi, user gõ, accept hunk...).
+    d.push(
       vscode.workspace.onDidChangeTextDocument((e) => {
-        if (e.document.uri.toString() !== document.uri.toString()) {
-          return;
-        }
-        if (webviewReady) {
-          postSet();
+        if (this.currentDoc === undefined) { return; }
+        if (e.document.uri.toString() !== this.currentDoc.uri.toString()) { return; }
+        if (this.webviewReady) {
+          this.postSet();
         } else {
-          pendingSet = true;
+          this.pendingSet = true;
         }
       })
     );
 
-    // Snapshot đổi (accept hunk) hoặc pending list đổi -> refresh nav counter.
-    disposables.push(
+    // Snapshot hoặc pending list đổi.
+    d.push(
       this.diffManager.onDidChangeDiffs((changedPath) => {
-        if (!webviewReady) {
-          pendingSet = true;
+        if (this.currentPath === undefined) { return; }
+        if (!this.webviewReady) {
+          this.pendingSet = true;
           return;
         }
-        // `undefined` = cả danh sách đổi (vd: accept all) -> ai cũng phải dựng
-        // lại. Ngược lại chỉ đúng tab của file đó cần diff lại; phần còn lại
-        // chỉ có mẫu số của counter là đổi.
-        const affectsThisFile =
-          changedPath === undefined || changedPath === normalizePath(filePath);
-        if (affectsThisFile) {
-          postSet();
+        // Đúng file đang xem thì phải diff lại; file khác thì chỉ mẫu số của
+        // counter đổi — gửi nguyên nội dung hai vế cho việc đó là lãng phí.
+        if (changedPath === undefined || changedPath === this.currentPath) {
+          this.postSet();
         } else {
-          postNav();
+          this.postNav();
         }
       })
     );
 
-    // Theme sync
-    disposables.push(
+    d.push(
       vscode.window.onDidChangeActiveColorTheme(() => {
-        void webviewPanel.webview.postMessage({
-          type: 'theme-change',
-          theme: currentMonacoTheme(),
-        });
+        void panel.webview.postMessage({ type: 'theme-change', theme: currentMonacoTheme() });
       })
     );
 
-    // Editor config sync
-    disposables.push(
+    d.push(
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (!e.affectsConfiguration('editor')) { return; }
-        void webviewPanel.webview.postMessage({
-          type: 'config-change',
-          editorConfig: readEditorConfig(),
-        });
+        void panel.webview.postMessage({ type: 'config-change', editorConfig: readEditorConfig() });
       })
     );
 
-    webviewPanel.onDidDispose(() => {
-      this.diffManager.unregisterPanel(filePath, webviewPanel);
-      while (disposables.length) {
-        disposables.pop()?.dispose();
+    // Webview bị ẩn thì iframe không có kích thước; khi hiện lại Monaco có thể
+    // còn giữ số đo cũ và chỉ vẽ được vài dòng. Ép đo lại.
+    d.push(
+      panel.onDidChangeViewState(() => {
+        if (!panel.visible) { return; }
+        void panel.webview.postMessage({ type: 'relayout' });
+      })
+    );
+
+    panel.onDidDispose(() => {
+      if (this.panel === panel) {
+        this.panel = undefined;
+        this.currentPath = undefined;
+        this.currentDoc = undefined;
+        this.webviewReady = false;
+        this.pendingSet = false;
+        void this.context.workspaceState.update(LAST_SHOWN_KEY, undefined);
+      }
+      while (this.panelDisposables.length) {
+        this.panelDisposables.pop()?.dispose();
       }
     });
 
-    // Nếu webview ready trước khi disposables setup xong (race), đảm bảo post lại.
-    if (pendingSet && webviewReady) {
-      postSet();
+    // Webview có thể `ready` trước khi listener kịp gắn (hiếm, nhưng rẻ để chặn).
+    if (this.pendingSet && this.webviewReady) {
+      this.postSet();
     }
   }
 
-  private async applyModifiedEdit(document: vscode.TextDocument, newCurrent: string): Promise<void> {
+  /**
+   * Path mà message này thực sự nói về, hoặc `undefined` nếu nó đã lỗi thời.
+   * Webview cũ chưa gửi kèm path -> tin vào file đang hiển thị.
+   */
+  private resolveTarget(fromMsg: string | undefined): string | undefined {
+    if (this.currentPath === undefined) { return undefined; }
+    if (fromMsg === undefined) { return this.currentPath; }
+    return normalizePath(fromMsg) === this.currentPath ? this.currentPath : undefined;
+  }
+
+  private postSet(): void {
+    if (!this.panel || this.currentPath === undefined || this.currentDoc === undefined) { return; }
+    const absPath = this.currentPath;
+    const snapshot = this.diffManager.getSnapshotContent(absPath);
+    if (snapshot === undefined) {
+      // Snapshot vừa biến mất (accept-all chẳng hạn) — không còn gì để vẽ.
+      this.detachIfShowing(absPath);
+      this.closeIfDetached();
+      return;
+    }
+    // Webview sống hoàn toàn trong LF: nó splice/join nội dung bằng '\n'
+    // (diff.monaco.js) rồi gửi ngược về, nên hai vế phải cùng ở LF thuần.
+    // EOL thật được khôi phục ở applyModifiedEdit() / DiffManager.writeFile().
+    const originalContent = toLf(snapshot);
+    const currentContent = toLf(this.currentDoc.getText());
+    this.pendingSet = false;
+    void this.panel.webview.postMessage({
+      type: 'set',
+      filePath: absPath,
+      language: detectLanguageId(absPath),
+      originalContent,
+      currentContent,
+      hunks: calculateHunks(originalContent, currentContent),
+      theme: currentMonacoTheme(),
+      editorConfig: readEditorConfig(),
+      nav: this.computeNav(absPath),
+    });
+  }
+
+  private postNav(): void {
+    if (!this.panel || this.currentPath === undefined) { return; }
+    void this.panel.webview.postMessage({ type: 'nav', nav: this.computeNav(this.currentPath) });
+  }
+
+  private async applyModifiedEdit(absPath: string, newCurrent: string): Promise<void> {
+    const document = this.currentDoc;
+    if (!document || normalizePath(document.uri.fsPath) !== absPath) { return; }
     // newCurrent từ webview luôn ở LF -> khôi phục EOL của document trước khi so
     // sánh lẫn khi ghi, nếu không file CRLF sẽ bị viết lại thành LF.
     const expanded = fromLf(
@@ -237,23 +419,17 @@ export class DiffEditorProvider implements vscode.CustomTextEditorProvider {
   private async gotoSibling(currentPath: string, direction: 1 | -1): Promise<void> {
     const pending = this.diffManager.getPendingFiles();
     if (pending.length <= 1) { return; }
-    const normalized = normalizePath(currentPath);
-    const idx = pending.findIndex(p => normalizePath(p) === normalized);
+    const idx = pending.findIndex(p => normalizePath(p) === currentPath);
     if (idx === -1) { return; }
-    const nextIdx = (idx + direction + pending.length) % pending.length;
-    const nextPath = pending[nextIdx];
+    const nextPath = pending[(idx + direction + pending.length) % pending.length];
     if (!nextPath) { return; }
     await this.diffManager.openDiff(nextPath);
   }
 
-  private computeNav(filePath: string): { currentIdx: number; total: number } {
+  private computeNav(absPath: string): { currentIdx: number; total: number } {
     const pending = this.diffManager.getPendingFiles();
-    const normalized = normalizePath(filePath);
-    const idx = pending.findIndex(p => normalizePath(p) === normalized);
-    return {
-      currentIdx: idx === -1 ? 0 : idx + 1,
-      total: pending.length,
-    };
+    const idx = pending.findIndex(p => normalizePath(p) === absPath);
+    return { currentIdx: idx === -1 ? 0 : idx + 1, total: pending.length };
   }
 
   private buildHtml(webview: vscode.Webview): string {
@@ -297,7 +473,7 @@ export class DiffEditorProvider implements vscode.CustomTextEditorProvider {
         <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6l4 4 4-4"/></svg>
       </button>
       <button id="btn-reject-file" class="toolbar-btn reject" title="Reject all changes in this file">Reject</button>
-      <button id="btn-accept-file" class="toolbar-btn accept" title="Accept all changes in this file (Ctrl+Shift+Y)">Accept</button>
+      <button id="btn-accept-file" class="toolbar-btn accept" title="Accept all changes in this file (Ctrl+Shift+Y)">Accept All</button>
     </div>
     <div class="pill pill-files">
       <button id="btn-prev-file" class="nav-btn" title="Previous file (Alt+H)" aria-label="Previous file">
@@ -314,6 +490,12 @@ export class DiffEditorProvider implements vscode.CustomTextEditorProvider {
 
   <script nonce="${nonce}">
     window.__MONACO_BASE__ = "${monacoBase}";
+    // Theme mặc định của Monaco là 'vs' — theme SÁNG (standaloneThemeService
+    // gọi setTheme(VS_LIGHT_THEME_NAME) ngay trong constructor). Không truyền
+    // theme thì editor dựng xong vẽ trắng cho tới khi message 'set' quay về —
+    // đó đúng là cái chớp trắng. Biết theme ngay trong HTML thì không còn
+    // frame nào sai màu.
+    window.__INITIAL_THEME__ = "${currentMonacoTheme()}";
   </script>
   <script nonce="${nonce}" src="${monacoBase}/loader.js"></script>
   <script nonce="${nonce}" src="${scriptUri}"></script>
@@ -360,6 +542,15 @@ function readEditorConfig(): EditorConfigPayload {
 function normalizePath(filePath: string): string {
   const fsPath = vscode.Uri.file(path.resolve(filePath)).fsPath;
   return process.platform === 'win32' ? fsPath.toLowerCase() : fsPath;
+}
+
+/** Case canonical từ OS, để tiêu đề tab hiện đúng như trên đĩa. */
+function canonicalCasePath(filePath: string): string {
+  try {
+    return fs.realpathSync.native(filePath);
+  } catch {
+    return filePath;
+  }
 }
 
 function makeNonce(): string {

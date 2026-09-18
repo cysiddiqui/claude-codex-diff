@@ -68,6 +68,36 @@
       inFlight: false,
     };
 
+    /**
+     * Mọi message đi ra đều kèm file đang hiển thị.
+     *
+     * Một webview giờ phục vụ MỌI file, nên message gửi đi ngay trước khi đổi
+     * file có thể tới nơi sau khi đã đổi — extension so path này với file hiện
+     * tại và bỏ qua message lỗi thời thay vì ghi nhầm sang file khác.
+     */
+    function send(msg) {
+      if (state.filePath && msg.type !== 'ready') {
+        msg.filePath = state.filePath;
+      }
+      vscodeApi.postMessage(msg);
+    }
+
+    /**
+     * Panel bị ẩn thì iframe không có kích thước; khi hiện lại Monaco có thể
+     * còn giữ số đo cũ và chỉ vẽ được vài dòng. Một lần layout() ngay lúc đó
+     * vẫn có thể đo trúng container chưa kịp bố trí -> đo thêm ở frame sau.
+     */
+    function forceLayout() {
+      if (!state.editor) { return; }
+      state.editor.layout();
+      repositionVisibleBar();
+    }
+    function forceLayoutSoon() {
+      forceLayout();
+      requestAnimationFrame(forceLayout);
+      setTimeout(forceLayout, 60);
+    }
+
     function getTopLine() {
       const ranges = state.editor && state.editor.getVisibleRanges();
       return ranges && ranges[0] ? ranges[0].startLineNumber : undefined;
@@ -76,7 +106,7 @@
     function flushCursor() {
       const pos = state.editor && state.editor.getPosition();
       if (!pos) { return; }
-      vscodeApi.postMessage({
+      send({
         type: 'cursor',
         line: pos.lineNumber,
         column: pos.column,
@@ -130,7 +160,11 @@
 
     const container = document.getElementById('container');
     tlog('before createEditor');
+    // Dựng thẳng bằng theme đúng. Gán luôn `currentTheme` để applySet() sau đó
+    // không gọi setTheme() lại một cách thừa thãi.
+    state.currentTheme = window.__INITIAL_THEME__ || null;
     state.editor = monaco.editor.create(container, {
+      theme: state.currentTheme || 'vs',
       readOnly: false,
       automaticLayout: true,
       glyphMargin: false,
@@ -149,7 +183,7 @@
       if (editDebounce) { clearTimeout(editDebounce); }
       editDebounce = setTimeout(() => {
         editDebounce = null;
-        vscodeApi.postMessage({ type: 'editModified', newCurrent: value });
+        send({ type: 'editModified', newCurrent: value });
       }, 200);
     });
 
@@ -158,7 +192,7 @@
       if (cursorDebounce) { clearTimeout(cursorDebounce); }
       cursorDebounce = setTimeout(() => {
         cursorDebounce = null;
-        vscodeApi.postMessage({
+        send({
           type: 'cursor',
           line: e.position.lineNumber,
           column: e.position.column,
@@ -196,13 +230,13 @@
       if (state.inFlight) { return; }
       setInFlight(true);
       flushCursor();
-      vscodeApi.postMessage({ type: 'acceptAll' });
+      send({ type: 'acceptAll' });
     });
     document.getElementById('btn-reject-file').addEventListener('click', () => {
       if (state.inFlight) { return; }
       setInFlight(true);
       flushCursor();
-      vscodeApi.postMessage({ type: 'rejectAll' });
+      send({ type: 'rejectAll' });
     });
     document.getElementById('btn-prev-hunk').addEventListener('click', () => {
       gotoHunk(-1);
@@ -212,11 +246,11 @@
     });
     document.getElementById('btn-next-file').addEventListener('click', () => {
       setHoveredGroup(-1);
-      vscodeApi.postMessage({ type: 'nextFile' });
+      send({ type: 'nextFile' });
     });
     document.getElementById('btn-prev-file').addEventListener('click', () => {
       setHoveredGroup(-1);
-      vscodeApi.postMessage({ type: 'prevFile' });
+      send({ type: 'prevFile' });
     });
 
     window.addEventListener('message', (event) => {
@@ -227,6 +261,7 @@
         // Chỉ counter file đổi (một file KHÁC vừa vào/ra hàng chờ). Không đụng
         // tới model, decoration hay view zone — đó mới là phần đắt.
         case 'nav': applyNav(msg.nav); return;
+        case 'relayout': forceLayoutSoon(); return;
         case 'theme-change': applyTheme(msg.theme); return;
         case 'config-change':
           applyConfig(msg.editorConfig);
@@ -238,7 +273,7 @@
     });
 
     tlog('post ready to extension');
-    vscodeApi.postMessage({ type: 'ready' });
+    send({ type: 'ready' });
 
     function applySet(msg) {
       tlog('applySet received hunks=' + (msg.hunks ? msg.hunks.length : 0));
@@ -591,14 +626,14 @@
       if (state.inFlight) { return; }
       const { newOriginal, newCurrent } = applyAccept(group);
       setInFlight(true);
-      vscodeApi.postMessage({ type: 'acceptHunk', newOriginal, newCurrent });
+      send({ type: 'acceptHunk', newOriginal, newCurrent });
     }
 
     function rejectGroup(group) {
       if (state.inFlight) { return; }
       const { newOriginal, newCurrent } = applyReject(group);
       setInFlight(true);
-      vscodeApi.postMessage({ type: 'rejectHunk', newOriginal, newCurrent });
+      send({ type: 'rejectHunk', newOriginal, newCurrent });
     }
 
     function registerActions() {
@@ -636,13 +671,13 @@
         id: 'ai-cli-diff.nextFile',
         label: 'AI CLI Diff: Next File',
         keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.KeyL],
-        run: () => vscodeApi.postMessage({ type: 'nextFile' }),
+        run: () => send({ type: 'nextFile' }),
       });
       state.editor.addAction({
         id: 'ai-cli-diff.prevFile',
         label: 'AI CLI Diff: Previous File',
         keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.KeyH],
-        run: () => vscodeApi.postMessage({ type: 'prevFile' }),
+        run: () => send({ type: 'prevFile' }),
       });
       state.editor.addAction({
         id: 'ai-cli-diff.acceptAll',
@@ -652,20 +687,20 @@
           if (state.inFlight) { return; }
           setInFlight(true);
           flushCursor();
-          vscodeApi.postMessage({ type: 'acceptAll' });
+          send({ type: 'acceptAll' });
         },
       });
       state.editor.addAction({
         id: 'ai-cli-diff.save',
         label: 'AI CLI Diff: Save',
         keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
-        run: () => vscodeApi.postMessage({ type: 'save' }),
+        run: () => send({ type: 'save' }),
       });
       state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => {
-        vscodeApi.postMessage({ type: 'undo' });
+        send({ type: 'undo' });
       });
       state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => {
-        vscodeApi.postMessage({ type: 'redo' });
+        send({ type: 'redo' });
       });
     }
 

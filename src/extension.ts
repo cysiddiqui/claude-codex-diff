@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { DiffManager } from './diff/diffManager';
-import { DiffEditorProvider, DIFF_EDITOR_VIEW_TYPE } from './diff/diffWebviewPanel';
+import { DiffPanelHost, DIFF_PANEL_VIEW_TYPE } from './diff/diffWebviewPanel';
 import { IAiRunner } from './runner/aiRunner';
 import { WorkspaceWatcher } from './watcher/workspaceWatcher';
 import { refreshTextFileRules } from './watcher/fileTypeRules';
@@ -22,16 +22,21 @@ export function activate(context: vscode.ExtensionContext): void {
   const gitBranchWatcher  = new GitBranchWatcher(diffManager, context.workspaceState, workspaceWatcher);
   const navigationManager = new NavigationManager(diffManager);
 
-  const diffEditorProvider = new DiffEditorProvider(context.extensionUri, diffManager);
+  // MỘT panel diff dùng chung cho mọi file. Không còn custom editor: mỗi tab
+  // custom editor là một webview riêng, tức một lần nạp Monaco riêng (~3.8 MB),
+  // và đó là toàn bộ độ trễ khi bấm next/prev. Xem diffWebviewPanel.ts.
+  const diffPanelHost = new DiffPanelHost(context.extensionUri, diffManager, context);
+  diffManager.attachPanelHost(diffPanelHost);
   context.subscriptions.push(
-    vscode.window.registerCustomEditorProvider(
-      DIFF_EDITOR_VIEW_TYPE,
-      diffEditorProvider,
-      {
-        webviewOptions: { retainContextWhenHidden: true },
-        supportsMultipleEditorsPerDocument: false,
-      }
-    )
+    // Sau khi reload window, VS Code khôi phục tab webview — không có
+    // serializer thì nó hiện một tab lỗi. Host tự quyết định mở lại file cũ
+    // hay đóng tab đi nếu file đó không còn pending.
+    vscode.window.registerWebviewPanelSerializer(DIFF_PANEL_VIEW_TYPE, {
+      async deserializeWebviewPanel(panel: vscode.WebviewPanel): Promise<void> {
+        diffPanelHost.adopt(panel);
+      },
+    }),
+    { dispose: () => diffPanelHost.close() }
   );
 
   const navBarPanel = new NavBarPanel(context.extensionUri);
